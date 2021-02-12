@@ -2,6 +2,8 @@ package poloniex
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -93,13 +95,19 @@ type WSClient struct {
 	Subs       map[string]chan interface{} // subscriptions map
 	wsConn     *websocket.Conn             // websocket connection
 	wsMutex    *sync.Mutex                 // prevent race condition for websocket RW
+	callbacks  map[string]func()           // callbacks
 	sync.Mutex                             // embedded mutex
 }
+
+const (
+	WSEventClose = "close" // websocket event close
+)
 
 // Web socket reader.
 func (ws *WSClient) readMessage() ([]byte, error) {
 	ws.wsMutex.Lock()
 	defer ws.wsMutex.Unlock()
+
 	_, rmsg, err := ws.wsConn.ReadMessage()
 	if err != nil {
 		return nil, err
@@ -137,21 +145,42 @@ func setChannelsId() (err error) {
 	return
 }
 
+// Subscribe to web socket events.
+func (ws *WSClient) On(event string, callback func()) (err error) {
+	if event == WSEventClose {
+		ws.callbacks[event] = callback
+		return nil
+	}
+
+	return errors.New(fmt.Sprintf("Websocket event (%s) not found! Please use events (%s)", event, WSEventClose))
+}
+
+// Connect to web socket
+func wsConnect(dialer *websocket.Dialer) (ws *websocket.Conn, err error) {
+	ws, _, err = dialer.Dial(pushAPIUrl, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	return ws, nil
+}
+
 // Create new web socket client.
 func NewWSClient() (wsClient *WSClient, err error) {
 	dialer := &websocket.Dialer{
 		HandshakeTimeout: time.Minute,
 	}
 
-	ws, _, err := dialer.Dial(pushAPIUrl, nil)
+	ws, err := wsConnect(dialer)
 	if err != nil {
 		return
 	}
 
 	wsClient = &WSClient{
-		wsConn:  ws,
-		Subs:    make(map[string]chan interface{}),
-		wsMutex: &sync.Mutex{},
+		wsConn:    ws,
+		Subs:      make(map[string]chan interface{}),
+		callbacks: make(map[string]func()),
+		wsMutex:   &sync.Mutex{},
 	}
 
 	if err = setChannelsId(); err != nil {
@@ -162,11 +191,14 @@ func NewWSClient() (wsClient *WSClient, err error) {
 		for {
 			err := wsClient.wsHandler()
 			if err != nil {
-				ws, _, _ := dialer.Dial(pushAPIUrl, nil)
-				wsClient.wsConn = ws
+				if wsClient.callbacks[WSEventClose] != nil {
+					wsClient.callbacks[WSEventClose]()
+					return
+				}
 			}
 		}
 	}()
+
 	return
 }
 
@@ -175,6 +207,7 @@ func NewWSClient() (wsClient *WSClient, err error) {
 // it is sent to the chans.
 func (ws *WSClient) wsHandler() error {
 	for {
+		ws.wsConn.SetReadDeadline(time.Now().Add(time.Second))
 		msg, err := ws.readMessage()
 		if err != nil {
 			return err
